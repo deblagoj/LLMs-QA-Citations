@@ -1,0 +1,64 @@
+
+{% extends "base.html" %}
+
+{% block content %} 
+
+
+
+
+<section class="vh-150 bg-image" style="background-color: #508bfc;">
+    <div class="mask d-flex align-items-center h-150 gradient-custom-3">
+      <div class="container h-100">
+        <div class="row d-flex justify-content-center align-items-center h-100">
+          <div class="col-12 col-md-9 col-lg-7 col-xl-6">
+            <div class="card" style="border-radius: 15px;">
+              <div class="card-body p-5">
+                <h2 class="text-center mb-5" >Ask a question</h2>
+  
+
+                    <form method="post" >
+                      {% csrf_token %}
+  
+                      <div class="form-outline mb-4">
+                        <label class="form-label" for="form3Example1cg">Question</label>
+                        <input name="question" type="text"  class="form-control form-control-lg" />
+                      </div>
+  
+                      <div class="d-flex justify-content-center">
+                        <button type="submit" value="Submit" class="btn btn-success btn-block btn-lg gradient-custom-4 text-body">Submit</button>
+                      </div>
+      
+                   
+                    </form>
+  
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+
+
+      <section class="vh-150 bg-image" style="background-color: #508bfc;">>
+        <div class="mask d-flex align-items-center h-150 gradient-custom-3">
+          <div class="container h-100">
+            <div class="row d-flex justify-content-center align-items-center h-100">
+              <div class="col-12 col-md-9 col-lg-7 col-xl-6">
+                <div class="card" style="border-radius: 15px;">
+                  <div class="card-body p-5">
+                    <h2 class="text-center mb-5">Get a response with citations</h2>
+      
+                                            <divOutput>{{response_text}}</divOutput>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+     
+
+
+{% endblock %}

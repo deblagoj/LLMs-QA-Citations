@@ -1,0 +1,1 @@
+__openAIkey__ = "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"
