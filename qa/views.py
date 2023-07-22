@@ -14,7 +14,6 @@ from django.conf import settings
 import os
 import pickle
 import sys
-os.environ["OPENAI_API_KEY"] = "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"
 
 
 # Create your views here.
