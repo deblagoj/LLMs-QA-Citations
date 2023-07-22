@@ -4,6 +4,8 @@ from django.http import HttpResponse
 from django.http import HttpResponseRedirect
 from django.shortcuts import render
 from paperqa import Docs
+from django.views.decorators.csrf import csrf_exempt
+
 
 from .forms import QuestionForm
 
@@ -12,14 +14,14 @@ from django.conf import settings
 import os
 import pickle
 import sys
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "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"
 
 
 # Create your views here.
 def index(request):
     return HttpResponse("Hello, world. You're at the polls index.")
 
-
+@csrf_exempt
 def get_question(request):
     response_text=''
 
