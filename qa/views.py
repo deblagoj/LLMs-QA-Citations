@@ -15,7 +15,6 @@ import os
 import pickle
 import sys
 
-os.environ['OPENAI_API_KEY'] = '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'
 
 # Create your views here.
 def index(request):
