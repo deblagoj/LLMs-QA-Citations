@@ -15,6 +15,7 @@ import os
 import pickle
 import sys
 
+os.environ['OPENAI_API_KEY'] = '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'
 
 # Create your views here.
 def index(request):
@@ -25,24 +26,35 @@ def get_question(request):
     response_text=''
 
     models_folder = settings.BASE_DIR /'qa'
-    print(models_folder)
+   # print('test')
+    #print(models_folder)
+    #print('test1')
     file_path = os.path.join(models_folder, os.path.basename("my_docs.pkl"))
+    print(file_path)
+    docs = Docs(index_path=None)
 
     with open(file_path, "rb") as f:
         docs = pickle.load(f)
+   
     # if this is a POST request we need to process the form data
+    
     if request.method == 'POST':
         # create a form instance and populate it with data from the request:
         form = QuestionForm(request.POST)
         # check whether it's valid:
        
+        
         if form.is_valid():
+          #  print('ok')
+            
+            
             clean_form = form.cleaned_data
             q = clean_form['question']
         
-            print(q)
-            answer = docs.query(q, k = 5, max_sources = 4)
-            print(answer.formatted_answer)
+           # print(q)
+            answer = docs.query(q,k = 5, max_sources = 4)
+  
+           
         
             response_text=answer.formatted_answer
 

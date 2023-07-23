@@ -1,20 +1,53 @@
-from .utils import maybe_is_code
-from html2text import html2text
+from pathlib import Path
+from typing import List
 
+from html2text import html2text
 from langchain.text_splitter import TokenTextSplitter
 
-TextSplitter = TokenTextSplitter
+from .types import Doc, Text
 
 
-def parse_pdf(path, citation, key, chunk_chars=2000, overlap=50):
+def parse_pdf_fitz(path: Path, doc: Doc, chunk_chars: int, overlap: int) -> List[Text]:
+    import fitz
+
+    file = fitz.open(path)
+    split = ""
+    pages: List[str] = []
+    texts: List[Text] = []
+    for i in range(file.page_count):
+        page = file.load_page(i)
+        split += page.get_text("text", sort=True)
+        pages.append(str(i + 1))
+        # split could be so long it needs to be split
+        # into multiple chunks. Or it could be so short
+        # that it needs to be combined with the next chunk.
+        while len(split) > chunk_chars:
+            # pretty formatting of pages (e.g. 1-3, 4, 5-7)
+            pg = "-".join([pages[0], pages[-1]])
+            texts.append(
+                Text(
+                    text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc
+                )
+            )
+            split = split[chunk_chars - overlap :]
+            pages = [str(i + 1)]
+    if len(split) > overlap:
+        pg = "-".join([pages[0], pages[-1]])
+        texts.append(
+            Text(text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc)
+        )
+    file.close()
+    return texts
+
+
+def parse_pdf(path: Path, doc: Doc, chunk_chars: int, overlap: int) -> List[Text]:
     import pypdf
 
     pdfFileObj = open(path, "rb")
     pdfReader = pypdf.PdfReader(pdfFileObj)
-    splits = []
     split = ""
-    pages = []
-    metadatas = []
+    pages: List[str] = []
+    texts: List[Text] = []
     for i, page in enumerate(pdfReader.pages):
         split += page.extract_text()
         pages.append(str(i + 1))
@@ -22,89 +55,95 @@ def parse_pdf(path, citation, key, chunk_chars=2000, overlap=50):
         # into multiple chunks. Or it could be so short
         # that it needs to be combined with the next chunk.
         while len(split) > chunk_chars:
-            splits.append(split[:chunk_chars])
             # pretty formatting of pages (e.g. 1-3, 4, 5-7)
             pg = "-".join([pages[0], pages[-1]])
-            metadatas.append(
-                dict(
-                    citation=citation,
-                    dockey=key,
-                    key=f"{key} pages {pg}",
+            texts.append(
+                Text(
+                    text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc
                 )
             )
             split = split[chunk_chars - overlap :]
             pages = [str(i + 1)]
     if len(split) > overlap:
-        splits.append(split[:chunk_chars])
         pg = "-".join([pages[0], pages[-1]])
-        metadatas.append(
-            dict(
-                citation=citation,
-                dockey=key,
-                key=f"{key} pages {pg}",
-            )
+        texts.append(
+            Text(text=split[:chunk_chars], name=f"{doc.docname} pages {pg}", doc=doc)
         )
     pdfFileObj.close()
-    return splits, metadatas
+    return texts
 
 
-def parse_txt(path, citation, key, chunk_chars=2000, overlap=50, html=False):
-
+def parse_txt(
+    path: Path, doc: Doc, chunk_chars: int, overlap: int, html: bool = False
+) -> List[Text]:
     try:
         with open(path) as f:
-            doc = f.read()
-    except UnicodeDecodeError as e:
+            text = f.read()
+    except UnicodeDecodeError:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            doc = f.read()
+            text = f.read()
     if html:
-        doc = html2text(doc)
+        text = html2text(text)
     # yo, no idea why but the texts are not split correctly
-    text_splitter = TextSplitter(chunk_size=chunk_chars, chunk_overlap=overlap)
-    texts = text_splitter.split_text(doc)
-    return texts, [dict(citation=citation, dockey=key, key=key)] * len(texts)
+    text_splitter = TokenTextSplitter(chunk_size=chunk_chars, chunk_overlap=overlap)
+    raw_texts = text_splitter.split_text(text)
+    texts = [
+        Text(text=t, name=f"{doc.docname} chunk {i}", doc=doc)
+        for i, t in enumerate(raw_texts)
+    ]
+    return texts
 
 
-def parse_code_txt(path, citation, key, chunk_chars=2000, overlap=50):
+def parse_code_txt(path: Path, doc: Doc, chunk_chars: int, overlap: int) -> List[Text]:
     """Parse a document into chunks, based on line numbers (for code)."""
 
-    splits = []
     split = ""
-    metadatas = []
+    texts: List[Text] = []
     last_line = 0
 
     with open(path) as f:
         for i, line in enumerate(f):
             split += line
             if len(split) > chunk_chars:
-                splits.append(split[:chunk_chars])
-                metadatas.append(
-                    dict(
-                        citation=citation,
-                        dockey=key,
-                        key=f"{key} lines {last_line}-{i}",
+                texts.append(
+                    Text(
+                        text=split[:chunk_chars],
+                        name=f"{doc.docname} lines {last_line}-{i}",
+                        doc=doc,
                     )
                 )
                 split = split[chunk_chars - overlap :]
                 last_line = i
     if len(split) > overlap:
-        splits.append(split[:chunk_chars])
-        metadatas.append(
-            dict(
-                citation=citation,
-                dockey=key,
-                key=f"{key} lines {last_line}-{i}",
+        texts.append(
+            Text(
+                text=split[:chunk_chars],
+                name=f"{doc.docname} lines {last_line}-{i}",
+                doc=doc,
             )
         )
-    return splits, metadatas
+    return texts
 
 
-def read_doc(path, citation, key, chunk_chars=3000, overlap=100, disable_check=False):
+def read_doc(
+    path: Path,
+    doc: Doc,
+    chunk_chars: int = 3000,
+    overlap: int = 100,
+    force_pypdf: bool = False,
+) -> List[Text]:
     """Parse a document into chunks."""
-    if path.endswith(".pdf"):
-        return parse_pdf(path, citation, key, chunk_chars, overlap)
-    elif path.endswith(".txt"):
-        return parse_txt(path, citation, key, chunk_chars, overlap)
-    elif path.endswith(".html"):
-        return parse_txt(path, citation, key, chunk_chars, overlap, html=True)
+    str_path = str(path)
+    if str_path.endswith(".pdf"):
+        if force_pypdf:
+            return parse_pdf(path, doc, chunk_chars, overlap)
+        try:
+            return parse_pdf_fitz(path, doc, chunk_chars, overlap)
+        except ImportError:
+            return parse_pdf(path, doc, chunk_chars, overlap)
+    elif str_path.endswith(".txt"):
+        return parse_txt(path, doc, chunk_chars, overlap)
+    elif str_path.endswith(".html"):
+        return parse_txt(path, doc, chunk_chars, overlap, html=True)
     else:
-        return parse_code_txt(path, citation, key, chunk_chars, overlap)
+        return parse_code_txt(path, doc, chunk_chars, overlap)

@@ -1,226 +1,364 @@
-from typing import List, Optional, Tuple, Dict, Callable, Any
-from functools import reduce
+import asyncio
 import os
-import os
-from pathlib import Path
 import re
-from .utils import maybe_is_text, maybe_is_truncated
-from .qaprompts import (
-    summary_prompt,
-    qa_prompt,
-    search_prompt,
-    citation_prompt,
-    chat_pref,
-)
-from dataclasses import dataclass
-from .readers import read_doc
-from langchain.vectorstores import FAISS
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.llms import OpenAI, OpenAIChat
-from langchain.llms.base import LLM
-from langchain.chains import LLMChain
-from langchain.callbacks import get_openai_callback
-from langchain.cache import SQLiteCache
-import langchain
+import sys
+import tempfile
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import BinaryIO, Dict, List, Optional, Set, Union, cast
 
-CACHE_PATH = Path.home() / ".paperqa" / "llm_cache.db"
-os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-langchain.llm_cache = SQLiteCache(CACHE_PATH)
+from langchain.base_language import BaseLanguageModel
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings.base import Embeddings
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.memory import ConversationTokenBufferMemory
+from langchain.memory.chat_memory import BaseChatMemory
+from langchain.vectorstores import FAISS, VectorStore
+from pydantic import BaseModel, validator
 
-
-@dataclass
-class Answer:
-    """A class to hold the answer to a question."""
-
-    question: str
-    answer: str = ""
-    context: str = ""
-    contexts: List[Any] = None
-    references: str = ""
-    formatted_answer: str = ""
-    passages: Dict[str, str] = None
-    tokens: int = 0
-
-    def __post_init__(self):
-        """Initialize the answer."""
-        if self.contexts is None:
-            self.contexts = []
-        if self.passages is None:
-            self.passages = {}
-
-    def __str__(self) -> str:
-        """Return the answer as a string."""
-        return self.formatted_answer
+from .chains import get_score, make_chain
+from .paths import PAPERQA_DIR
+from .readers import read_doc
+from .types import Answer, CallbackFactory, Context, Doc, DocKey, PromptCollection, Text
+from .utils import (
+    gather_with_concurrency,
+    guess_is_4xx,
+    maybe_is_html,
+    maybe_is_pdf,
+    maybe_is_text,
+    md5sum,
+    name_in_text,
+)
 
 
-class Docs:
+class Docs(BaseModel, arbitrary_types_allowed=True, smart_union=True):
     """A collection of documents to be used for answering questions."""
 
-    def __init__(
-        self,
-        chunk_size_limit: int = 3000,
-        llm: Optional[LLM] = None,
-        summary_llm: Optional[LLM] = None,
-        name: str = "default",
-        index_path: Optional[Path] = None,
-    ) -> None:
-        """Initialize the collection of documents.
+    docs: Dict[DocKey, Doc] = {}
+    texts: List[Text] = []
+    docnames: Set[str] = set()
+    texts_index: Optional[VectorStore] = None
+    doc_index: Optional[VectorStore] = None
+    llm: Union[str, BaseLanguageModel] = ChatOpenAI(
+        temperature=0.1, model="gpt-3.5-turbo", client=None
+    )
+    summary_llm: Optional[Union[str, BaseLanguageModel]] = None
+    name: str = "default"
+    index_path: Optional[Path] = PAPERQA_DIR / name
+    embeddings: Embeddings = OpenAIEmbeddings(client=None)
+    max_concurrent: int = 5
+    deleted_dockeys: Set[DocKey] = set()
+    prompts: PromptCollection = PromptCollection()
+    memory: bool = False
+    memory_model: Optional[BaseChatMemory] = None
+    jit_texts_index: bool = False
 
+    # TODO: Not sure how to get this to work
+    # while also passing mypy checks
+    @validator("llm", "summary_llm")
+    def check_llm(cls, v: Union[BaseLanguageModel, str]) -> BaseLanguageModel:
+        if type(v) is str:
+            return ChatOpenAI(temperature=0.1, model=v, client=None)
+        return cast(BaseLanguageModel, v)
 
+    @validator("summary_llm", always=True)
+    def copy_llm_if_not_set(cls, v, values):
+        return v or values["llm"]
 
-        Args:
-            chunk_size_limit: The maximum number of characters to use for a single chunk of text.
-            llm: The language model to use for answering questions. Default - OpenAI chat-gpt-turbo
-            summary_llm: The language model to use for summarizing documents. If None, llm is used.
-            name: The name of the collection.
-            index_path: The path to the index file IF pickled. If None, defaults to using name in $HOME/.paperqa/name
-        """
-        self.docs = dict()
-        self.chunk_size_limit = chunk_size_limit
-        self.keys = set()
-        self._faiss_index = None
-        if llm is None:
-            llm = OpenAIChat(temperature=0.1, max_tokens=512, prefix_messages=chat_pref)
-        if summary_llm is None:
-            summary_llm = llm
-        self.update_llm(llm, summary_llm)
-        if index_path is None:
-            index_path = Path.home() / ".paperqa" / name
-        self.index_path = index_path
-        self.name = name
-
-    def update_llm(self, llm: LLM, summary_llm: Optional[LLM] = None) -> None:
-        """Update the LLM for answering questions."""
-        self.llm = llm
-        if summary_llm is None:
-            summary_llm = llm
-        self.summary_llm = summary_llm
-        self.summary_chain = LLMChain(prompt=summary_prompt, llm=summary_llm)
-        self.qa_chain = LLMChain(prompt=qa_prompt, llm=llm)
-        self.search_chain = LLMChain(prompt=search_prompt, llm=llm)
-        self.cite_chain = LLMChain(prompt=citation_prompt, llm=llm)
-
-    def add(
-        self,
-        path: str,
-        citation: Optional[str] = None,
-        key: Optional[str] = None,
-        disable_check: bool = False,
-        chunk_chars: Optional[int] = 3000,
-    ) -> None:
-        """Add a document to the collection."""
-
-        if citation is None:
-            # peak first chunk
-            texts, _ = read_doc(path, "", "", chunk_chars=chunk_chars)
-            with get_openai_callback() as cb:
-                citation = self.cite_chain.run(texts[0])
-            if len(citation) < 3 or "Unknown" in citation or "insufficient" in citation:
-                citation = f"Unknown, {os.path.basename(path)}, {datetime.now().year}"
-
-        if path in self.docs:
-            raise ValueError(f"Document {path} already in collection.")
-        if key is None:
-            # get first name and year from citation
-            try:
-                author = re.search(r"([A-Z][a-z]+)", citation).group(1)
-            except AttributeError:
-                # panicking - no word??
-                raise ValueError(
-                    f"Could not parse key from citation {citation}. Consider just passing key explicitly - e.g. docs.py (path, citation, key='mykey')"
+    @validator("memory_model", always=True)
+    def check_memory_model(cls, v, values):
+        if values["memory"]:
+            if v is None:
+                return ConversationTokenBufferMemory(
+                    llm=values["summary_llm"],
+                    max_token_limit=512,
+                    memory_key="memory",
+                    human_prefix="Question",
+                    ai_prefix="Answer",
+                    input_key="Question",
+                    output_key="Answer",
                 )
-            try:
-                year = re.search(r"(\d{4})", citation).group(1)
-            except AttributeError:
-                year = ""
-            key = f"{author}{year}"
+            if v.memory_variables()[0] != "memory":
+                raise ValueError("Memory model must have memory_variables=['memory']")
+            return values["memory_model"]
+        return None
+
+    def clear_docs(self):
+        self.texts = []
+        self.docs = {}
+        self.docnames = set()
+
+    def update_llm(
+        self,
+        llm: Union[BaseLanguageModel, str],
+        summary_llm: Optional[Union[BaseLanguageModel, str]] = None,
+    ) -> None:
+        """Update the LLM for answering questions."""
+        if type(llm) is str:
+            llm = ChatOpenAI(temperature=0.1, model=llm, client=None)
+        if type(summary_llm) is str:
+            summary_llm = ChatOpenAI(temperature=0.1, model=summary_llm, client=None)
+        self.llm = cast(BaseLanguageModel, llm)
+        if summary_llm is None:
+            summary_llm = llm
+        self.summary_llm = cast(BaseLanguageModel, summary_llm)
+
+    def _get_unique_name(self, docname: str) -> str:
+        """Create a unique name given proposed name"""
         suffix = ""
-        while key + suffix in self.keys:
+        while docname + suffix in self.docnames:
             # move suffix to next letter
             if suffix == "":
                 suffix = "a"
             else:
                 suffix = chr(ord(suffix) + 1)
-        key += suffix
-        self.keys.add(key)
+        docname += suffix
+        return docname
 
-        texts, metadata = read_doc(path, citation, key, chunk_chars=chunk_chars)
+    def add_file(
+        self,
+        file: BinaryIO,
+        citation: Optional[str] = None,
+        docname: Optional[str] = None,
+        dockey: Optional[DocKey] = None,
+        chunk_chars: int = 3000,
+    ) -> Optional[str]:
+        """Add a document to the collection."""
+        # just put in temp file and use existing method
+        suffix = ".txt"
+        if maybe_is_pdf(file):
+            suffix = ".pdf"
+        elif maybe_is_html(file):
+            suffix = ".html"
+
+        with tempfile.NamedTemporaryFile(suffix=suffix) as f:
+            f.write(file.read())
+            f.seek(0)
+            return self.add(
+                Path(f.name),
+                citation=citation,
+                docname=docname,
+                dockey=dockey,
+                chunk_chars=chunk_chars,
+            )
+
+    def add_url(
+        self,
+        url: str,
+        citation: Optional[str] = None,
+        docname: Optional[str] = None,
+        dockey: Optional[DocKey] = None,
+        chunk_chars: int = 3000,
+    ) -> Optional[str]:
+        """Add a document to the collection."""
+        import urllib.request
+
+        with urllib.request.urlopen(url) as f:
+            # need to wrap to enable seek
+            file = BytesIO(f.read())
+            return self.add_file(
+                file,
+                citation=citation,
+                docname=docname,
+                dockey=dockey,
+                chunk_chars=chunk_chars,
+            )
+
+    def add(
+        self,
+        path: Path,
+        citation: Optional[str] = None,
+        docname: Optional[str] = None,
+        disable_check: bool = False,
+        dockey: Optional[DocKey] = None,
+        chunk_chars: int = 3000,
+    ) -> Optional[str]:
+        """Add a document to the collection."""
+        if dockey is None:
+            dockey = md5sum(path)
+        if citation is None:
+            # skip system because it's too hesitant to answer
+            cite_chain = make_chain(
+                prompt=self.prompts.cite,
+                llm=cast(BaseLanguageModel, self.summary_llm),
+                skip_system=True,
+            )
+            # peak first chunk
+            fake_doc = Doc(docname="", citation="", dockey=dockey)
+            texts = read_doc(path, fake_doc, chunk_chars=chunk_chars, overlap=100)
+            if len(texts) == 0:
+                raise ValueError(f"Could not read document {path}. Is it empty?")
+            citation = cite_chain.run(texts[0].text)
+            if len(citation) < 3 or "Unknown" in citation or "insufficient" in citation:
+                citation = f"Unknown, {os.path.basename(path)}, {datetime.now().year}"
+
+        if docname is None:
+            # get first name and year from citation
+            match = re.search(r"([A-Z][a-z]+)", citation)
+            if match is not None:
+                author = match.group(1)  # type: ignore
+            else:
+                # panicking - no word??
+                raise ValueError(
+                    f"Could not parse docname from citation {citation}. "
+                    "Consider just passing key explicitly - e.g. docs.py "
+                    "(path, citation, key='mykey')"
+                )
+            year = ""
+            match = re.search(r"(\d{4})", citation)
+            if match is not None:
+                year = match.group(1)  # type: ignore
+            docname = f"{author}{year}"
+        docname = self._get_unique_name(docname)
+        doc = Doc(docname=docname, citation=citation, dockey=dockey)
+        texts = read_doc(path, doc, chunk_chars=chunk_chars, overlap=100)
         # loose check to see if document was loaded
-        #
-        if len("".join(texts)) < 10 or (
-            not disable_check and not maybe_is_text("".join(texts))
+        if (
+            len(texts) == 0
+            or len(texts[0].text) < 10
+            or (not disable_check and not maybe_is_text(texts[0].text))
         ):
             raise ValueError(
                 f"This does not look like a text document: {path}. Path disable_check to ignore this error."
             )
+        if self.add_texts(texts, doc):
+            return docname
+        return None
 
-        self.docs[path] = dict(texts=texts, metadata=metadata, key=key)
-        if self._faiss_index is not None:
-            self._faiss_index.add_texts(texts, metadatas=metadata)
+    def add_texts(
+        self,
+        texts: List[Text],
+        doc: Doc,
+    ) -> bool:
+        """Add chunked texts to the collection. This is useful if you have already chunked the texts yourself.
 
-    def clear(self) -> None:
-        """Clear the collection of documents."""
-        self.docs = dict()
-        self.keys = set()
-        self._faiss_index = None
-        # delete index file
-        pkl = self.index_path / "index.pkl"
-        if pkl.exists():
-            pkl.unlink()
-        fs = self.index_path / "index.faiss"
-        if fs.exists():
-            fs.unlink()
+        Returns True if the document was added, False if it was already in the collection.
+        """
+        if doc.dockey in self.docs:
+            return False
+        if len(texts) == 0:
+            raise ValueError("No texts to add.")
+        if doc.docname in self.docnames:
+            new_docname = self._get_unique_name(doc.docname)
+            for t in texts:
+                t.name = t.name.replace(doc.docname, new_docname)
+            doc.docname = new_docname
+        if texts[0].embeddings is None:
+            text_embeddings = self.embeddings.embed_documents([t.text for t in texts])
+            for i, t in enumerate(texts):
+                t.embeddings = text_embeddings[i]
+        else:
+            text_embeddings = cast(List[List[float]], [t.embeddings for t in texts])
+        if self.texts_index is not None:
+            try:
+                # TODO: Simplify - super weird
+                vec_store_text_and_embeddings = list(
+                    map(lambda x: (x.text, x.embeddings), texts)
+                )
+                self.texts_index.add_embeddings(  # type: ignore
+                    vec_store_text_and_embeddings,
+                    metadatas=[t.dict(exclude={"embeddings", "text"}) for t in texts],
+                )
+            except AttributeError:
+                raise ValueError("Need a vector store that supports adding embeddings.")
+        if self.doc_index is not None:
+            self.doc_index.add_texts([doc.citation], metadatas=[doc.dict()])
+        self.docs[doc.dockey] = doc
+        self.texts += texts
+        self.docnames.add(doc.docname)
+        return True
 
-    @property
-    def doc_previews(self) -> List[Tuple[int, str, str]]:
-        """Return a list of tuples of (key, citation) for each document."""
-        return [
-            (
-                len(doc["texts"]),
-                doc["metadata"][0]["dockey"],
-                doc["metadata"][0]["citation"],
+    def delete(
+        self, name: Optional[str] = None, dockey: Optional[DocKey] = None
+    ) -> None:
+        """Delete a document from the collection."""
+        if name is not None:
+            doc = next((doc for doc in self.docs.values() if doc.docname == name), None)
+            if doc is None:
+                return
+            self.docnames.remove(doc.docname)
+            dockey = doc.dockey
+        del self.docs[dockey]
+        self.deleted_dockeys.add(dockey)
+
+    async def adoc_match(
+        self, query: str, k: int = 25, get_callbacks: CallbackFactory = lambda x: None
+    ) -> Set[DocKey]:
+        """Return a list of dockeys that match the query."""
+        if self.doc_index is None:
+            if len(self.docs) == 0:
+                return set()
+            texts = [doc.citation for doc in self.docs.values()]
+            metadatas = [d.dict() for d in self.docs.values()]
+            self.doc_index = FAISS.from_texts(
+                texts, metadatas=metadatas, embedding=self.embeddings
             )
-            for doc in self.docs.values()
+        matches = self.doc_index.max_marginal_relevance_search(
+            query, k=k + len(self.deleted_dockeys)
+        )
+        # filter the matches
+        matches = [
+            m for m in matches if m.metadata["dockey"] not in self.deleted_dockeys
         ]
+        try:
+            # for backwards compatibility (old pickled objects)
+            matched_docs = [self.docs[m.metadata["dockey"]] for m in matches]
+        except KeyError:
+            matched_docs = [Doc(**m.metadata) for m in matches]
+        if len(matched_docs) == 0:
+            return set()
+        chain = make_chain(
+            self.prompts.select, cast(BaseLanguageModel, self.llm), skip_system=True
+        )
+        papers = [f"{d.docname}: {d.citation}" for d in matched_docs]
+        result = await chain.arun(  # type: ignore
+            question=query, papers="\n".join(papers), callbacks=get_callbacks("filter")
+        )
+        return set([d.dockey for d in matched_docs if d.docname in result])
 
-    # to pickle, we have to save the index as a file
     def __getstate__(self):
-        if self._faiss_index is None and len(self.docs) > 0:
-            self._build_faiss_index()
         state = self.__dict__.copy()
-        if self._faiss_index is not None:
-            state["_faiss_index"].save_local(self.index_path)
-        del state["_faiss_index"]
-        # remove LLMs (they can have callbacks, which can't be pickled)
-        del state["summary_chain"]
-        del state["qa_chain"]
-        del state["cite_chain"]
-        del state["search_chain"]
-        return state
+        if self.texts_index is not None and self.index_path is not None:
+            state["texts_index"].save_local(self.index_path)
+        del state["texts_index"]
+        del state["doc_index"]
+        return {"__dict__": state, "__fields_set__": self.__fields_set__}
 
     def __setstate__(self, state):
-        self.__dict__.update(state)
+        object.__setattr__(self, "__dict__", state["__dict__"])
+        object.__setattr__(self, "__fields_set__", state["__fields_set__"])
         try:
-            self._faiss_index = FAISS.load_local(self.index_path, OpenAIEmbeddings())
-        except:
+            self.texts_index = FAISS.load_local(self.index_path, self.embeddings)
+        except Exception:
             # they use some special exception type, but I don't want to import it
-            self._faiss_index = None
-        self.update_llm(
-            OpenAIChat(temperature=0.1, max_tokens=512, prefix_messages=chat_pref)
-        )
+            self.texts_index = None
+        self.doc_index = None
 
-    def _build_faiss_index(self):
-        if self._faiss_index is None:
-            texts = reduce(
-                lambda x, y: x + y, [doc["texts"] for doc in self.docs.values()], []
+    def _build_texts_index(self, keys: Optional[Set[DocKey]] = None):
+        if keys is not None and self.jit_texts_index:
+            del self.texts_index
+            self.texts_index = None
+        if self.texts_index is None:
+            texts = self.texts
+            if keys is not None:
+                texts = [t for t in texts if t.doc.dockey in keys]
+            if len(texts) == 0:
+                return
+            raw_texts = [t.text for t in texts]
+            text_embeddings = [t.embeddings for t in texts]
+            metadatas = [t.dict(exclude={"embeddings", "text"}) for t in texts]
+            self.texts_index = FAISS.from_embeddings(
+                # wow adding list to the zip was tricky
+                text_embeddings=list(zip(raw_texts, text_embeddings)),
+                embedding=self.embeddings,
+                metadatas=metadatas,
             )
-            metadatas = reduce(
-                lambda x, y: x + y, [doc["metadata"] for doc in self.docs.values()], []
-            )
-            self._faiss_index = FAISS.from_texts(
-                texts, OpenAIEmbeddings(), metadatas=metadatas
-            )
+
+    def clear_memory(self):
+        """Clear the memory of the model."""
+        if self.memory_model is not None:
+            self.memory_model.clear()
 
     def get_evidence(
         self,
@@ -228,143 +366,258 @@ class Docs:
         k: int = 3,
         max_sources: int = 5,
         marginal_relevance: bool = True,
-    ) -> str:
-        if self._faiss_index is None:
-            self._build_faiss_index()
+        get_callbacks: CallbackFactory = lambda x: None,
+    ) -> Answer:
+        # special case for jupyter notebooks
+        if "get_ipython" in globals() or "google.colab" in sys.modules:
+            import nest_asyncio
 
+            nest_asyncio.apply()
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            self.aget_evidence(
+                answer,
+                k=k,
+                max_sources=max_sources,
+                marginal_relevance=marginal_relevance,
+                get_callbacks=get_callbacks,
+            )
+        )
+
+    async def aget_evidence(
+        self,
+        answer: Answer,
+        k: int = 3,
+        max_sources: int = 5,
+        marginal_relevance: bool = True,
+        get_callbacks: CallbackFactory = lambda x: None,
+    ) -> Answer:
+        if len(self.docs) == 0 and self.doc_index is None:
+            return answer
+        self._build_texts_index(keys=answer.dockey_filter)
+        if self.texts_index is None:
+            return answer
+        self.texts_index = cast(VectorStore, self.texts_index)
+        _k = k
+        if answer.dockey_filter is not None:
+            _k = k * 10  # heuristic
         # want to work through indices but less k
         if marginal_relevance:
-            docs = self._faiss_index.max_marginal_relevance_search(
-                answer.question, k=k, fetch_k=5 * k
+            matches = self.texts_index.max_marginal_relevance_search(
+                answer.question, k=_k, fetch_k=5 * _k
             )
         else:
-            docs = self._faiss_index.similarity_search(
-                answer.question, k=k, fetch_k=5 * k
+            matches = self.texts_index.similarity_search(
+                answer.question, k=_k, fetch_k=5 * _k
             )
-        for doc in docs:
-            c = (
-                doc.metadata["key"],
-                doc.metadata["citation"],
-                self.summary_chain.run(
-                    question=answer.question, context_str=doc.page_content
+        # ok now filter
+        if answer.dockey_filter is not None:
+            matches = [
+                m
+                for m in matches
+                if m.metadata["doc"]["dockey"] in answer.dockey_filter
+            ]
+
+        # check if it is deleted
+        matches = [
+            m
+            for m in matches
+            if m.metadata["doc"]["dockey"] not in self.deleted_dockeys
+        ]
+
+        # check if it is already in answer
+        cur_names = [c.text.name for c in answer.contexts]
+        matches = [m for m in matches if m.metadata["name"] not in cur_names]
+
+        # now finally cut down
+        matches = matches[:k]
+
+        async def process(match):
+            callbacks = get_callbacks("evidence:" + match.metadata["name"])
+            summary_chain = make_chain(
+                self.prompts.summary, self.summary_llm, memory=self.memory_model
+            )
+            # This is dangerous because it
+            # could mask errors that are important- like auth errors
+            # I also cannot know what the exception
+            # type is because any model could be used
+            # my best idea is see if there is a 4XX
+            # http code in the exception
+            try:
+                context = await summary_chain.arun(
+                    question=answer.question,
+                    citation=match.metadata["doc"]["citation"],
+                    summary_length=answer.summary_length,
+                    text=match.page_content,
+                    callbacks=callbacks,
+                )
+            except Exception as e:
+                if guess_is_4xx(str(e)):
+                    return None
+                raise e
+            if "not applicable" in context.lower():
+                return None
+            c = Context(
+                context=context,
+                text=Text(
+                    text=match.page_content,
+                    name=match.metadata["name"],
+                    doc=Doc(**match.metadata["doc"]),
                 ),
-                doc.page_content,
+                score=get_score(context),
             )
-            if "Not applicable" not in c[2]:
-                answer.contexts.append(c)
-                yield answer
-            if len(answer.contexts) == max_sources:
-                break
+            return c
+
+        results = await gather_with_concurrency(
+            self.max_concurrent, *[process(m) for m in matches]
+        )
+        # filter out failures
+        contexts = [c for c in results if c is not None]
+        if len(contexts) == 0:
+            return answer
+        contexts = sorted(contexts, key=lambda x: x.score, reverse=True)
+        contexts = contexts[:max_sources]
+        # add to answer contexts
+        answer.contexts += contexts
         context_str = "\n\n".join(
-            [f"{k}: {s}" for k, c, s, t in answer.contexts if "Not applicable" not in s]
+            [f"{c.text.name}: {c.context}" for c in answer.contexts]
         )
-        valid_keys = [k for k, c, s, t in answer.contexts if "Not applicable" not in s]
-        if len(valid_keys) > 0:
-            context_str += "\n\nValid keys: " + ", ".join(valid_keys)
+        valid_names = [c.text.name for c in answer.contexts]
+        context_str += "\n\nValid keys: " + ", ".join(valid_names)
         answer.context = context_str
-        yield answer
-
-    def generate_search_query(self, query: str) -> List[str]:
-        """Generate a list of search strings that can be used to find
-        relevant papers.
-
-        Args:
-            query (str): The query to generate search strings for.
-        """
-
-        search_query = self.search_chain.run(question=query)
-        queries = [s for s in search_query.split("\n") if len(s) > 3]
-        # remove 2., 3. from queries
-        queries = [re.sub(r"^\d+\.\s*", "", q) for q in queries]
-        return queries
-
-    def query_gen(
-        self,
-        query: str,
-        k: int = 10,
-        max_sources: int = 5,
-        length_prompt: str = "about 100 words",
-        marginal_relevance: bool = True,
-    ):
-        yield from self._query(
-            query,
-            k=k,
-            max_sources=max_sources,
-            length_prompt=length_prompt,
-            marginal_relevance=marginal_relevance,
-        )
+        return answer
 
     def query(
         self,
         query: str,
         k: int = 10,
         max_sources: int = 5,
-        length_prompt: str = "about 100 words",
+        length_prompt="about 100 words",
         marginal_relevance: bool = True,
-    ):
-        for answer in self._query(
-            query,
-            k=k,
-            max_sources=max_sources,
-            length_prompt=length_prompt,
-            marginal_relevance=marginal_relevance,
-        ):
-            pass
-        return answer
+        answer: Optional[Answer] = None,
+        key_filter: Optional[bool] = None,
+        get_callbacks: CallbackFactory = lambda x: None,
+    ) -> Answer:
+        # special case for jupyter notebooks
+        if "get_ipython" in globals() or "google.colab" in sys.modules:
+            import nest_asyncio
 
-    def _query(
+            nest_asyncio.apply()
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            self.aquery(
+                query,
+                k=k,
+                max_sources=max_sources,
+                length_prompt=length_prompt,
+                marginal_relevance=marginal_relevance,
+                answer=answer,
+                key_filter=key_filter,
+                get_callbacks=get_callbacks,
+            )
+        )
+
+    async def aquery(
         self,
         query: str,
-        k: int,
-        max_sources: int,
-        length_prompt: str,
-        marginal_relevance: bool,
-    ):
+        k: int = 10,
+        max_sources: int = 5,
+        length_prompt: str = "about 100 words",
+        marginal_relevance: bool = True,
+        answer: Optional[Answer] = None,
+        key_filter: Optional[bool] = None,
+        get_callbacks: CallbackFactory = lambda x: None,
+    ) -> Answer:
         if k < max_sources:
             raise ValueError("k should be greater than max_sources")
-        tokens = 0
-        answer = Answer(query)
-        with get_openai_callback() as cb:
-            for answer in self.get_evidence(
+        if answer is None:
+            answer = Answer(question=query, answer_length=length_prompt)
+        if len(answer.contexts) == 0:
+            # this is heuristic - k and len(docs) are not
+            # comparable - one is chunks and one is docs
+            if key_filter or (key_filter is None and len(self.docs) > k):
+                keys = await self.adoc_match(
+                    answer.question, get_callbacks=get_callbacks
+                )
+                if len(keys) > 0:
+                    answer.dockey_filter = keys
+            answer = await self.aget_evidence(
                 answer,
                 k=k,
                 max_sources=max_sources,
                 marginal_relevance=marginal_relevance,
-            ):
-                yield answer
-            tokens += cb.total_tokens
-        context_str, citations = answer.context, answer.contexts
+                get_callbacks=get_callbacks,
+            )
+        if self.prompts.pre is not None:
+            chain = make_chain(
+                self.prompts.pre,
+                cast(BaseLanguageModel, self.llm),
+                memory=self.memory_model,
+            )
+            pre = await chain.arun(
+                question=answer.question, callbacks=get_callbacks("pre")
+            )
+            answer.context = pre + "\n\n" + answer.context
         bib = dict()
-        passages = dict()
-        if len(context_str) < 10:
+        if len(answer.context) < 10 and not self.memory:
             answer_text = (
                 "I cannot answer this question due to insufficient information."
             )
         else:
-            with get_openai_callback() as cb:
-                answer_text = self.qa_chain.run(
-                    question=query, context_str=context_str, length=length_prompt
-                )
-                tokens += cb.total_tokens
-        # it still happens lol
-        if "(Foo2012)" in answer_text:
-            answer_text = answer_text.replace("(Foo2012)", "")
-        for key, citation, summary, text in citations:
+            callbacks = get_callbacks("answer")
+            qa_chain = make_chain(
+                self.prompts.qa,
+                cast(BaseLanguageModel, self.llm),
+                memory=self.memory_model,
+            )
+            answer_text = await qa_chain.arun(
+                context=answer.context,
+                answer_length=answer.answer_length,
+                question=answer.question,
+                callbacks=callbacks,
+            )
+        # it still happens
+        if "(Example2012)" in answer_text:
+            answer_text = answer_text.replace("(Example2012)", "")
+        for c in answer.contexts:
+            name = c.text.name
+            citation = c.text.doc.citation
             # do check for whole key (so we don't catch Callahan2019a with Callahan2019)
-            skey = key.split(" ")[0]
-            if skey + " " in answer_text or skey + ")" in answer_text:
-                bib[skey] = citation
-                passages[key] = text
+            if name_in_text(name, answer_text):
+                bib[name] = citation
         bib_str = "\n\n".join(
             [f"{i+1}. ({k}): {c}" for i, (k, c) in enumerate(bib.items())]
         )
-        formatted_answer = f"Question: {query}\n\n{answer_text}\n"
+        formatted_answer = f"Question: {answer.question}\n\n{answer_text}\n"
         if len(bib) > 0:
             formatted_answer += f"\nReferences\n\n{bib_str}\n"
-        formatted_answer += f"\nTokens Used: {tokens} Cost: ${tokens/1000 * 0.002:.2f}"
         answer.answer = answer_text
         answer.formatted_answer = formatted_answer
         answer.references = bib_str
-        answer.passages = passages
-        answer.tokens = tokens
-        yield answer
+
+        if self.prompts.post is not None:
+            chain = make_chain(
+                self.prompts.post,
+                cast(BaseLanguageModel, self.llm),
+                memory=self.memory_model,
+            )
+            post = await chain.arun(**answer.dict(), callbacks=get_callbacks("post"))
+            answer.answer = post
+            answer.formatted_answer = f"Question: {answer.question}\n\n{post}\n"
+            if len(bib) > 0:
+                answer.formatted_answer += f"\nReferences\n\n{bib_str}\n"
+        if self.memory_model is not None:
+            answer.memory = self.memory_model.load_memory_variables(inputs={})["memory"]
+            self.memory_model.save_context(
+                {"Question": answer.question}, {"Answer": answer.answer}
+            )
+
+        return answer

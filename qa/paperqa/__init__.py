@@ -1,4 +1,4 @@
-from .docs import Docs, maybe_is_text, Answer
-from .version import version
+from .docs import Answer, Docs, PromptCollection, Doc, Text
+from .version import __version__
 
-
+__all__ = ["Docs", "Answer", "PromptCollection", "__version__", "Doc", "Text"]
